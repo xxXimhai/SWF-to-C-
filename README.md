@@ -1,35 +1,30 @@
 # SWF to C++
 
-Convert Adobe Flash `.swf` files into a self-contained C++ project that
-reconstructs the timeline and replays it with [SFML](https://www.sfml-dev.org/).
+Convert Adobe Flash `.swf` files into a self-contained native C++ player
+that reconstructs the timeline and replays it — no SFML, no external
+dependencies beyond a C++17 compiler (and libX11 on Linux).
 
-This is **not** a 1:1 ActionScript→C++ translator — that is not viable. Instead,
-it is an *extraction and reconstruction* pipeline:
+This is **not** a 1:1 ActionScript→C++ translator — that is not viable.
+Instead, it is an *extraction and reconstruction* pipeline:
 
 1. **Extract assets** — images (JPEG, lossless PNG), sounds (MP3, PCM/WAV),
    sprite timelines.
-2. **Rebuild the timeline** — display-list placements, frame labels and sound
-   cues are parsed into a compact `timeline.json` plus generated C++ data.
-3. **Generate a C++ project** — a CMake project with a `SwfAssetLoader`
-   player that draws the extracted assets frame by frame.
+2. **Rasterize vector shapes** — `DefineShape*` records are parsed
+   (fills, gradients, strokes) and rendered to PNG in software.
+3. **Rebuild the timeline** — display-list placements with full affine
+   matrices and color transforms, frame labels and sound cues are parsed
+   into a compact `timeline.json` plus generated C++ data.
+4. **Generate a C++ project** — a CMake project with a dependency-free
+   player: software renderer, X11 window on Linux, Win32 window on
+   Windows, WAV/MP3 audio via miniaudio, and a headless `--frames` mode
+   that exports PNG screenshots.
 
 ## Requirements
 
 - Python 3.9+ (no third-party packages; the SWF parser is built in)
 - CMake 3.16+
 - A C++17 compiler
-- SFML 2.x development libraries
-
-### Installing SFML
-
-| OS      | Command                                                        |
-|---------|----------------------------------------------------------------|
-| Ubuntu  | `sudo apt install libsfml-dev`                                 |
-| Debian  | `sudo apt install libsfml-dev`                                 |
-| Fedora  | `sudo dnf install sfml-devel`                                  |
-| macOS   | `brew install sfml`                                            |
-| Windows | `vcpkg install sfml` or download from sfml-dev.org             |
-| Conda   | `conda install -c conda-forge sfml`                             |
+- Linux only: `libx11-dev` (X11 headers); Windows needs nothing extra
 
 ## Usage
 
@@ -42,43 +37,66 @@ This creates:
 ```
 output_dir/
 ├── assets/
-│   ├── images/      # extracted bitmaps as PNG/JPEG
+│   ├── images/      # extracted bitmaps + rasterized shapes (PNG/JPEG)
 │   └── sounds/      # extracted sounds as MP3/WAV
 ├── src/
-│   ├── main.cpp            # SFML player + SwfAssetLoader
-│   ├── timeline_data.h     # generated timeline tables (header)
-│   └── timeline_data.cpp   # generated timeline tables (source)
+│   ├── main.cpp            # player entry point
+│   ├── platform_*.cpp      # X11 / Win32 window backends
+│   ├── swfrender.*         # software renderer (stb_image)
+│   ├── audio.*             # miniaudio + minimp3 playback
+│   ├── timeline_data.*     # generated timeline tables
+│   └── vendor/             # vendored single-header libraries
 ├── timeline.json           # full extracted timeline metadata
 ├── CMakeLists.txt
+├── build.sh / build.bat
 └── README.generated.md
 ```
 
-Then build and run the generated player:
+### Build — Linux
 
 ```bash
 cd output_dir
-mkdir build && cd build
-cmake .. -DCMAKE_PREFIX_PATH=<path-to-SFML>   # optional, if not on PATH
-cmake --build .
-./swf_player          # or swf_player.exe on Windows
+./build.sh        # cmake + make
 ```
 
-Assets are resolved relative to the working directory, so run the binary
-from `output_dir/` (or copy `assets/` next to it).
+Requires `libx11-dev` (e.g. `sudo apt install libx11-dev`) for the
+windowed mode. Everything else is vendored.
+
+### Build — Windows
+
+```bat
+build.bat
+```
+
+Works with Visual Studio 2019+ or MinGW-w64 (cmake on PATH). Produces
+`build\Release\swf_player.exe`.
+
+### Run
+
+```bash
+./build/swf_player                  # windowed playback
+./build/swf_player --frames 120     # headless: export 120 PNG frames
+./build/swf_player --frames-dir out/ --frames 0   # export whole movie
+```
+
+Run from anywhere — the player resolves `assets/` relative to the
+working directory and the executable location. Controls: **Space**
+pause, **R** restart, **P** pause, **Esc** quit.
 
 ## What is supported
 
-- SWF containers: `FWS` (uncompressed) and `CWS` (zlib-compressed).
-  `ZWS` (LZMA) is rejected with a clear error.
-- Tags: `ShowFrame`, `DefineShape*` (parsed for bitmap fills),
-  `PlaceObject2/3`, `RemoveObject2`, `DefineBits` (JPEG), `DefineBitsJPEG2/3`,
-  `DefineBitsLossless/Lossless2`, `DefineSound`, `StartSound`,
-  `SoundStreamHead/Head2/Block`, `DefineSprite`, `FrameLabel`,
-  `SetBackgroundColor`, `JPEGTables`.
-- Timeline reconstruction: display-list snapshots per frame, sprite
-  sub-timelines, frame labels and sound cues.
-- Bitmap fills inside vector shapes are approximated by drawing the
-  referenced bitmap (a common Flash-game pattern).
+- SWF containers: `FWS` (uncompressed), `CWS` (zlib) and `ZWS` (LZMA).
+- Tags: `ShowFrame`, `DefineShape`/`2`/`3`/`4` (full style parsing:
+  solid/gradient/focal-gradient/bitmap fills, strokes, line joins),
+  `PlaceObject2/3` (matrices incl. rotate/skew, color transforms,
+  visibility; filters are tolerated but not rendered),
+  `RemoveObject2`, `DefineBits*` (JPEG/lossless), `DefineSound`,
+  `StartSound`, `SoundStreamHead/Head2/Block`, `DefineSprite`,
+  `FrameLabel`, `SetBackgroundColor`, `JPEGTables`.
+- Vector rasterization: fills with supersampled coverage, gradient and
+  bitmap fills, strokes with caps/joins — emitted as PNG per shape.
+- Timeline reconstruction: per-frame display lists, sprite sub-timelines,
+  frame labels, sound cues.
 
 ## Limitations
 
@@ -86,24 +104,28 @@ from `output_dir/` (or copy `assets/` next to it).
   `DoInitAction`, sprite class scripts, event handlers) is ignored.
   Interaction/gameplay logic must be ported to C++ manually — use
   `timeline.json` and the FFDec/JPEXS decompiler for reference.
-- **Vector shapes are not rendered.** Shapes without bitmap fills are
-  skipped; shapes *with* bitmap fills draw the bitmap stretched over the
-  fill area. Gradients, strokes and morphs are not reproduced.
+- **Filters and blend modes** on `PlaceObject3` are approximated
+  (rendered without the effect; a warning is recorded).
 - **JPEG3 alpha** is not merged — the JPEG is saved without its alpha
   channel (a warning is printed).
-- `DefineBitsJPEG4` is skipped. `PlaceObject3` filters, blend modes and
-  clip actions are ignored.
-- Fonts (`DefineFont*`, `DefineEditText`) are not extracted yet.
-- Sounds stream correctly as cues, but streaming audio blocks are only
-  partially reconstructed.
-- `ZWS` (LZMA-compressed) SWFs are not supported.
+- `DefineBitsJPEG4` is skipped; morph shapes (`DefineMorphShape*`) and
+  fonts (`DefineFont*`, `DefineEditText`, `DefineText*`) are not
+  extracted; text is not rendered.
+- Shape rasterization is an approximation (supersampled coverage, no
+  exact pixel-center rules); complex self-intersecting fills may differ
+  slightly from Flash.
+- Streaming audio (`SoundStreamBlock`) is only partially reconstructed.
 
 ## Repository layout
 
 ```
 swf_to_cpp.py          # the converter (single-file, stdlib only)
+templates/             # C++ player sources copied into generated projects
+vendor/                # vendored stb_image, stb_image_write, minimp3,
+                       # miniaudio single-header libraries
 tools/make_test_swf.py # synthetic SWF generator used by the test suite
 tests/                 # fixtures and validation scripts
+meatboy.swf            # sample game used for development
 ```
 
 ## Development
@@ -112,9 +134,12 @@ tests/                 # fixtures and validation scripts
 # regenerate the bundled test fixture
 python3 tools/make_test_swf.py tests/fixtures/simple.swf
 
-# convert it and build the result
-python3 swf_to_cpp.py tests/fixtures/simple.swf /tmp/simple_out
-cd /tmp/simple_out/build && cmake .. && cmake --build .
+# run the test suite (converts, builds the C++ player, exports frames)
+python3 tests/test_smoke.py
+
+# convert the bundled sample
+python3 swf_to_cpp.py meatboy.swf /tmp/meatboy_out
+cd /tmp/meatboy_out && ./build.sh && ./build/swf_player --frames 60
 ```
 
 ## License

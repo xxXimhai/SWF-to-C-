@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 """
 swf_to_cpp.py — Extract assets and timeline metadata from a .swf file and
-generate a buildable C++ (SFML) project skeleton.
+generate a buildable, self-contained native C++ player (Linux/Windows).
 
 This is NOT an ActionScript-to-C++ translator. It is a pipeline that:
 
-  1. Parses the SWF container (FWS/CWS; ZWS/LZMA is rejected).
+  1. Parses the SWF container (FWS/CWS/ZWS).
   2. Extracts bitmap characters (JPEG / lossless) to PNG/JPEG files.
-  3. Extracts sound characters (MP3 / PCM->WAV) and MP3 sound streams.
-  4. Reconstructs the display list per frame (PlaceObject / RemoveObject /
-     ShowFrame) into a compact timeline description.
-  5. Emits a CMake project (src/main.cpp + src/timeline_data.h) that plays
-     the extracted frames back with SFML.
+  3. Rasterizes vector shape characters to PNG files.
+  4. Extracts sound characters (MP3 / PCM->WAV) and MP3 sound streams.
+  5. Reconstructs the display list per frame (PlaceObject / RemoveObject /
+     ShowFrame) into a compact timeline description, including matrices
+     and color transforms.
+  6. Emits a dependency-free CMake project (software renderer, X11 on
+     Linux / Win32 on Windows, miniaudio audio) that plays the extracted
+     frames back.
 
 Usage:
     python3 swf_to_cpp.py input.swf output_dir
@@ -21,7 +24,10 @@ import argparse
 import binascii
 import io
 import json
+import lzma
+import math
 import os
+import shutil
 import struct
 import sys
 import zlib
@@ -92,17 +98,25 @@ def read_matrix(br: BitReader):
             "sx": scale_x, "sy": scale_y, "k0": skew0, "k1": skew1}
 
 
-def read_cxform_with_alpha(br: BitReader):
-    """Skip a CXFORMWITHALPHA record."""
+def read_cxform(br: BitReader, alpha=True):
+    """Parse CXFORM/CXFORMWITHALPHA.
+
+    Returns (mult, add): 4-element lists of floats. mult is the 8.8 fixed
+    multiply factor (1.0 = identity), add the -1..1 additive term.
+    """
     has_add = br.read_bits(1)
     has_mult = br.read_bits(1)
     nbits = br.read_bits(4)
+    nch = 4 if alpha else 3
+    mult = [1.0] * 4
+    add = [0.0] * 4
     if has_mult:
-        for _ in range(4):
-            br.read_bits(nbits)          # fixed 8.8 mults (RGBA)
+        for i in range(nch):
+            mult[i] = br.read_sbits(nbits) / 256.0
     if has_add:
-        for _ in range(4):
-            br.read_sbits(nbits)         # signed adds (RGBA)
+        for i in range(nch):
+            add[i] = br.read_sbits(nbits) / 255.0
+    return mult, add
 
 
 def read_cstring(buf: bytes, off: int):
@@ -270,99 +284,680 @@ def sniff_image_ext(data: bytes) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Shape style scanning — we don't render vector shapes, but we record which
-# bitmap characters each shape references through bitmap fill/line styles so
-# the generated player can approximate them with the bitmap image.
+# Vector shape parsing (DefineShape/2/3/4) + CPU rasterization.
+#
+# Style arrays are byte aligned; shape records form a continuous MSB-first
+# bit stream. Style indices in records are 1-based (0 = no style).
 # ---------------------------------------------------------------------------
 
 
-def _read_count(buf, off, extended):
-    n = buf[off]
-    off += 1
-    if n == 0xFF and extended:
-        n = struct.unpack_from("<H", buf, off)[0]
-        off += 2
-    return n, off
+def _shape_color(buf, off, has_alpha):
+    """RGB or RGBA color record -> (r, g, b, a) with a in 0..255."""
+    if has_alpha:
+        return (buf[off], buf[off + 1], buf[off + 2], buf[off + 3]), off + 4
+    return (buf[off], buf[off + 1], buf[off + 2], 255), off + 3
 
 
-def _skip_gradient(buf, off, with_alpha):
+def _read_gradient(buf, off, has_alpha):
+    """GRADIENT/FOCALGRADIENT record (minus focal point) -> (dict, new_off)."""
     flags = buf[off]
     off += 1
-    ncolors = flags & 0x0F
-    csize = 4 if with_alpha else 3
-    off += ncolors * (1 + csize)   # ratio u8 + color
-    return off
+    spread = flags >> 6
+    interp = (flags >> 4) & 0x3
+    n = flags & 0x0F
+    stops = []
+    for _ in range(n):
+        ratio = buf[off] / 255.0
+        col, off = _shape_color(buf, off + 1, has_alpha)
+        stops.append((ratio, col))
+    return {"spread": spread, "interp": interp, "stops": stops}, off
 
 
-def _skip_fill_style(buf, off, with_alpha):
-    """Skip one fill style; returns (bitmap_id_or_None, new_off)."""
+def _read_matrix_at(buf, off):
+    br = BitReader(buf[off:])
+    m = read_matrix(br)
+    return m, off + br.byte_len()
+
+
+def _read_fill_style(buf, off, version):
+    """One FILLSTYLE record -> (style_dict, new_off)."""
+    has_alpha = version >= 3
     t = buf[off]
     off += 1
-    if t == 0x00:                       # solid
-        off += 4 if with_alpha else 3
-        return None, off
-    if t in (0x10, 0x12):               # linear / radial gradient
-        off += _matrix_len(buf, off)
-        return None, _skip_gradient(buf, off, with_alpha)
-    if t == 0x13:                       # focal gradient
-        off += _matrix_len(buf, off)
-        off = _skip_gradient(buf, off, with_alpha)
-        off += 4                        # focal point (2 x fixed8.8)
-        return None, off
-    if 0x40 <= t <= 0x43:               # bitmap fill
+    if t == 0x00:                                    # solid
+        col, off = _shape_color(buf, off, has_alpha)
+        return {"type": "solid", "color": col}, off
+    if t in (0x10, 0x12, 0x13):                      # gradients
+        m, off = _read_matrix_at(buf, off)
+        g, off = _read_gradient(buf, off, has_alpha)
+        st = {"type": "grad",
+              "kind": {0x10: "linear", 0x12: "radial", 0x13: "focal"}[t],
+              "matrix": m, "grad": g}
+        if t == 0x13:                               # focal point FIXED8
+            st["focal"] = struct.unpack_from("<h", buf, off)[0] / 256.0
+            off += 2
+        return st, off
+    if 0x40 <= t <= 0x43:                            # bitmap fill
         bmp = struct.unpack_from("<H", buf, off)[0]
-        off += 2 + _matrix_len(buf, off + 2)
-        return bmp, off
-    raise ValueError(f"unknown fill style type 0x{t:02x}")
+        off += 2
+        m, off = _read_matrix_at(buf, off)
+        return {"type": "bitmap", "bmp": bmp, "matrix": m,
+                "smooth": t in (0x40, 0x41)}, off
+    raise ValueError("fill style type 0x%02x" % t)
 
 
-def _matrix_len(buf, off):
-    br = BitReader(buf[off:])
-    read_matrix(br)
-    return br.byte_len()
+def _read_line_style(buf, off, version):
+    """One LINESTYLE record -> (style_dict, new_off)."""
+    width = struct.unpack_from("<H", buf, off)[0]
+    off += 2
+    if version <= 3:
+        col, off = _shape_color(buf, off, version >= 3)
+        return {"width": width / 20.0, "paint": ("solid", col)}, off
+    # LINESTYLE2 (DefineShape4): 16 bits of flags, then fill or color
+    flags = struct.unpack_from(">H", buf, off)[0]
+    off += 2
+    join = (flags >> 12) & 0x3
+    has_fill = (flags >> 11) & 0x1
+    if join == 2:                                    # miter limit FIXED8
+        off += 2
+    if has_fill:
+        fill, off = _read_fill_style(buf, off, version)
+        paint = ("fill", fill)
+    else:
+        col, off = _shape_color(buf, off, True)
+        paint = ("solid", col)
+    return {"width": width / 20.0, "paint": paint}, off
 
 
-def _skip_line_style(buf, off, version):
-    """Skip one line style; returns (bitmap_id_or_None, new_off).
+def _read_style_array(buf, off, version, kind):
+    """FILLSTYLEARRAY/LINESTYLEARRAY -> (styles, new_off).
 
-    Shape1 line styles are width+RGB only; Shape2+ carry a full fill style.
+    styles[0] is None: record index 0 means "no style".
     """
-    off += 2                            # width u16
-    if version == 1:
-        off += 3                        # RGB
-        return None, off
-    return _skip_fill_style(buf, off, with_alpha=(version >= 3))
+    n = buf[off]
+    off += 1
+    if n == 0xFF and (kind == "line" or version != 1):
+        n = struct.unpack_from("<H", buf, off)[0]
+        off += 2
+    reader = _read_fill_style if kind == "fill" else _read_line_style
+    styles = [None]
+    for _ in range(n):
+        s, off = reader(buf, off, version)
+        styles.append(s)
+    return styles, off
 
 
-def scan_shape(tag_id, p):
-    """Parse a DefineShape* tag header + style arrays.
+def _shape_records(br, data, base_off, version, fills, lines,
+                   fill_bits, line_bits):
+    """Parse SHAPERECORDS -> (edges, fills, lines).
 
-    Returns (shape_id, width_px, height_px, [bitmap_ids]) or None.
-    tag_id: 2=Shape1, 22=Shape2, 32=Shape3, 83=Shape4.
+    br reads bits from data[base_off:]; br.pos is relative to that slice.
     """
-    version = {2: 1, 22: 2, 32: 3, 83: 4}.get(tag_id, 2)
-    with_alpha = version >= 3
-    extended = version != 1
+    edges = []
+    f0 = f1 = ln = 0
+    cx = cy = 0
+    while True:
+        if br.read_bits(1) == 0:                      # non-edge record
+            newstyles = br.read_bits(1)
+            has_line = br.read_bits(1)
+            has_f1 = br.read_bits(1)
+            has_f0 = br.read_bits(1)
+            has_move = br.read_bits(1)
+            if not (newstyles or has_line or has_f1 or has_f0 or has_move):
+                break                                 # EndShapeRecord
+            # value order per spec/FFDec: MoveTo, Fill0, Fill1, Line
+            if has_move:
+                mb = br.read_bits(5)
+                cx += br.read_sbits(mb)
+                cy += br.read_sbits(mb)
+                edges.append({"kind": "move", "x": cx, "y": cy})
+            if has_f0:
+                f0 = br.read_bits(fill_bits)
+            if has_f1:
+                f1 = br.read_bits(fill_bits)
+            if has_line:
+                ln = br.read_bits(line_bits)
+            if newstyles:
+                br.align()
+                off = base_off + (br.pos >> 3)
+                fills, off = _read_style_array(data, off, version, "fill")
+                lines, off = _read_style_array(data, off, version, "line")
+                br2 = BitReader(data[off:])
+                fill_bits = br2.read_bits(4)
+                line_bits = br2.read_bits(4)
+                br.pos = (off + br2.byte_len() - base_off) * 8
+            continue
+        # edge record
+        if br.read_bits(1):                           # straight edge
+            nbits = br.read_bits(4)
+            if br.read_bits(1):                       # general line
+                dx = br.read_sbits(nbits + 2)
+                dy = br.read_sbits(nbits + 2)
+            elif br.read_bits(1):                     # vertical line
+                dx, dy = 0, br.read_sbits(nbits + 2)
+            else:                                     # horizontal line
+                dx, dy = br.read_sbits(nbits + 2), 0
+            nx, ny = cx + dx, cy + dy
+            edges.append({"kind": "line", "f0": f0, "f1": f1, "line": ln,
+                          "pts": ((cx, cy), (nx, ny))})
+            cx, cy = nx, ny
+        else:                                         # curved edge
+            nbits = br.read_bits(4)
+            cdx = br.read_sbits(nbits + 2)
+            cdy = br.read_sbits(nbits + 2)
+            adx = br.read_sbits(nbits + 2)
+            ady = br.read_sbits(nbits + 2)
+            nx, ny = cx + adx, cy + ady
+            edges.append({"kind": "quad", "f0": f0, "f1": f1, "line": ln,
+                          "pts": ((cx, cy), (cx + cdx, cy + cdy), (nx, ny))})
+            cx, cy = nx, ny
+    return edges, fills, lines
+
+
+def parse_shape(tag_id, p):
+    """Fully parse a DefineShape/2/3/4 tag.
+
+    Returns dict with bounds (twips), style arrays and edge records,
+    or None on failure.
+    """
+    version = {2: 1, 22: 2, 32: 3, 83: 4}.get(tag_id)
+    if version is None:
+        return None
     try:
         sid = struct.unpack_from("<H", p, 0)[0]
         br = BitReader(p[2:])
         xmin, xmax, ymin, ymax = read_rect(br)
+        br.align()
         off = 2 + br.byte_len()
-
-        bitmaps = []
-        n, off = _read_count(p, off, extended)
-        for _ in range(n):
-            bmp, off = _skip_fill_style(p, off, with_alpha)
-            if bmp is not None:
-                bitmaps.append(bmp)
-        n, off = _read_count(p, off, extended)
-        for _ in range(n):
-            bmp, off = _skip_line_style(p, off, version)
-            if bmp is not None:
-                bitmaps.append(bmp)
-        return sid, (xmax - xmin) / 20.0, (ymax - ymin) / 20.0, bitmaps
+        # SHAPEWITHSTYLE (all DefineShape* tags): style arrays precede
+        # the 4+4 bit style-index counts.
+        fills, off = _read_style_array(p, off, version, "fill")
+        lines, off = _read_style_array(p, off, version, "line")
+        br = BitReader(p[off:])
+        fill_bits = br.read_bits(4)
+        line_bits = br.read_bits(4)
+        edges, fills, lines = _shape_records(br, p, off, version, fills,
+                                             lines, fill_bits, line_bits)
+        return {"sid": sid, "version": version,
+                "bounds": (xmin, xmax, ymin, ymax),
+                "fills": fills, "lines": lines, "edges": edges}
     except Exception:
         return None
+
+
+# --- PNG decoding (for bitmap fills sourced from our own PNG output) -------
+
+
+def decode_png_rgba(data):
+    """Decode a PNG to (w, h, rgba_bytes). Supports 8-bit gray/RGB/palette/
+    RGBA, non-interlaced, all scanline filters. Returns None on failure."""
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        return None
+    pos = 8
+    idat = bytearray()
+    plte = b""
+    trns = b""
+    w = h = bitdepth = ctype = interlace = None
+    try:
+        while pos + 8 <= len(data):
+            ln = struct.unpack_from(">I", data, pos)[0]
+            tag = data[pos + 4:pos + 8]
+            chunk = data[pos + 8:pos + 8 + ln]
+            pos += 12 + ln
+            if tag == b"IHDR":
+                w, h, bitdepth, ctype, _comp, _filt, interlace = \
+                    struct.unpack(">IIBBBBB", chunk)
+            elif tag == b"PLTE":
+                plte = chunk
+            elif tag == b"tRNS":
+                trns = chunk
+            elif tag == b"IDAT":
+                idat += chunk
+            elif tag == b"IEND":
+                break
+        if (w is None or bitdepth != 8 or interlace != 0
+                or ctype not in (0, 2, 3, 6)):
+            return None
+        channels = {0: 1, 2: 3, 3: 1, 6: 4}[ctype]
+        bpp = channels
+        stride = w * channels
+        raw = zlib.decompress(bytes(idat))
+        if len(raw) < h * (stride + 1):
+            return None
+        rows = []
+        prev = bytearray(stride)
+        rp = 0
+        for _y in range(h):
+            f = raw[rp]
+            rp += 1
+            line = bytearray(raw[rp:rp + stride])
+            rp += stride
+            if f == 1:
+                for i in range(bpp, stride):
+                    line[i] = (line[i] + line[i - bpp]) & 0xFF
+            elif f == 2:
+                for i in range(stride):
+                    line[i] = (line[i] + prev[i]) & 0xFF
+            elif f == 3:
+                for i in range(stride):
+                    a = line[i - bpp] if i >= bpp else 0
+                    line[i] = (line[i] + ((a + prev[i]) >> 1)) & 0xFF
+            elif f == 4:
+                for i in range(stride):
+                    a = line[i - bpp] if i >= bpp else 0
+                    b = prev[i]
+                    c = prev[i - bpp] if i >= bpp else 0
+                    pp = a + b - c
+                    pa, pb, pc = abs(pp - a), abs(pp - b), abs(pp - c)
+                    pr = a if (pa <= pb and pa <= pc) else \
+                        (b if pb <= pc else c)
+                    line[i] = (line[i] + pr) & 0xFF
+            elif f != 0:
+                return None
+            rows.append(bytes(line))
+            prev = line
+    except Exception:
+        return None
+
+    out = bytearray(w * h * 4)
+    if ctype == 6:
+        flat = bytearray()
+        for r_ in rows:
+            flat += r_
+        out = flat
+    elif ctype == 2:
+        for y in range(h):
+            s = y * stride
+            d = y * w * 4
+            for x in range(w):
+                o = s + x * 3
+                out[d:d + 4] = bytes((rows[y][o], rows[y][o + 1],
+                                      rows[y][o + 2], 255))
+                d += 4
+    elif ctype == 0:
+        for y in range(h):
+            s = y * stride
+            d = y * w * 4
+            for x in range(w):
+                g = rows[y][s + x]
+                a = trns[1] if len(trns) >= 2 and g == trns[0] else 255
+                out[d:d + 4] = bytes((g, g, g, a))
+                d += 4
+    elif ctype == 3:
+        nplte = len(plte) // 3
+        for y in range(h):
+            s = y * stride
+            d = y * w * 4
+            for x in range(w):
+                idx = rows[y][s + x]
+                if idx < nplte:
+                    o = idx * 3
+                    r_, g_, b_ = plte[o], plte[o + 1], plte[o + 2]
+                else:
+                    r_ = g_ = b_ = 0
+                a = trns[idx] if idx < len(trns) else 255
+                out[d:d + 4] = bytes((r_, g_, b_, a))
+                d += 4
+    return w, h, bytes(out)
+
+
+# --- rasterizer -------------------------------------------------------------
+
+
+def _flatten_quad(p0, pc, p1, tol, out, depth=0):
+    x0, y0 = p0
+    xc, yc = pc
+    x1, y1 = p1
+    dx, dy = x1 - x0, y1 - y0
+    l2 = dx * dx + dy * dy
+    if l2 == 0:
+        d = math.hypot(xc - x0, yc - y0)
+    else:
+        d = abs(dy * xc - dx * yc + x1 * y0 - y1 * x0) / math.sqrt(l2)
+    if d <= tol or depth > 12:
+        out.append(p1)
+        return
+    ax = (x0 + xc) * 0.5
+    ay = (y0 + yc) * 0.5
+    bx = (xc + x1) * 0.5
+    by = (yc + y1) * 0.5
+    mx = (ax + bx) * 0.5
+    my = (ay + by) * 0.5
+    _flatten_quad(p0, (ax, ay), (mx, my), tol, out, depth + 1)
+    _flatten_quad((mx, my), (bx, by), p1, tol, out, depth + 1)
+
+
+def _coverage(segs, w, h, ss):
+    """Nonzero-winding coverage of directed segments.
+
+    segs: list of (x0, y0, x1, y1) in device pixels.
+    Returns list of w*h floats in 0..1.
+    """
+    cov = [0.0] * (w * h)
+    nrows = h * ss
+    scale = float(ss)
+    for sy in range(nrows):
+        y = (sy + 0.5) / scale
+        xs = []
+        for x0, y0, x1, y1 in segs:
+            if (y0 <= y < y1) or (y1 <= y < y0):
+                xs.append((x0 + (y - y0) * (x1 - x0) / (y1 - y0),
+                           1 if y1 > y0 else -1))
+        if not xs:
+            continue
+        xs.sort()
+        dy = sy // ss
+        base = dy * w
+        wind = 0
+        prev_x = 0.0
+        for i, (x, s) in enumerate(xs):
+            if i and wind:
+                a = prev_x * scale
+                b = x * scale
+                if b > a:
+                    c0 = int(a) // ss
+                    c1 = int(b - 1e-9) // ss
+                    for c in range(max(c0, 0), min(c1, w - 1) + 1):
+                        lo = max(a, c * scale)
+                        hi = min(b, (c + 1) * scale)
+                        if hi > lo:
+                            cov[base + c] += (hi - lo) / scale
+            wind += s
+            prev_x = x
+    inv = 1.0 / ss
+    return [c * inv for c in cov]
+
+
+def _stamp_circle(cov, w, h, ss, cx, cy, r):
+    """Add a filled circle of radius r (px) centered at (cx, cy) to cov."""
+    x0 = max(0, int(cx - r - 1))
+    x1 = min(w - 1, int(cx + r + 1))
+    y0 = max(0, int(cy - r - 1))
+    y1 = min(h - 1, int(cy + r + 1))
+    r2 = r * r
+    for py in range(y0, y1 + 1):
+        for px in range(x0, x1 + 1):
+            cnt = 0
+            for sy in range(ss):
+                ddy = (py + (sy + 0.5) / ss) - cy
+                for sx in range(ss):
+                    ddx = (px + (sx + 0.5) / ss) - cx
+                    if ddx * ddx + ddy * ddy <= r2:
+                        cnt += 1
+            if cnt:
+                i = py * w + px
+                cov[i] = min(1.0, cov[i] + cnt / (ss * ss))
+
+
+def _stroke_coverage(runs, w, h, ss):
+    """runs: list of (width_px, [points]) -> coverage list."""
+    cov = [0.0] * (w * h)
+    for width, pts in runs:
+        if len(pts) < 2 or width <= 0:
+            continue
+        r = width * 0.5
+        step = max(0.35, r * 0.6)
+        for i in range(len(pts) - 1):
+            x0, y0 = pts[i]
+            x1, y1 = pts[i + 1]
+            seglen = math.hypot(x1 - x0, y1 - y0)
+            if seglen == 0:
+                continue
+            n = max(1, int(seglen / step))
+            for k in range(n + 1):
+                t = k / n
+                _stamp_circle(cov, w, h, ss, x0 + (x1 - x0) * t,
+                              y0 + (y1 - y0) * t, r)
+    return cov
+
+
+def _mat_apply(m, x, y):
+    """Apply SWF matrix dict (shape units) to point -> (u, v)."""
+    return (m["sx"] * x + m["k0"] * y + m["tx"],
+            m["k1"] * x + m["sy"] * y + m["ty"])
+
+
+def _gradient_lut(grad):
+    """Precompute t in [0,1] -> (r,g,b,a) for a gradient (256 entries)."""
+    stops = grad["stops"]
+    lut = []
+    si = 0
+    for i in range(256):
+        t = i / 255.0
+        while si + 1 < len(stops) and stops[si + 1][0] < t:
+            si += 1
+        if si + 1 >= len(stops):
+            lut.append(stops[-1][1])
+            continue
+        r0, c0 = stops[si]
+        r1, c1 = stops[si + 1]
+        if r1 <= r0:
+            lut.append(c1)
+            continue
+        f = (t - r0) / (r1 - r0)
+        lut.append(tuple(int(c0[k] + (c1[k] - c0[k]) * f + 0.5)
+                         for k in range(4)))
+    return lut
+
+
+def _spread_t(t, spread):
+    if spread == 1:                    # reflect
+        t = t - 2.0 * math.floor((t + 1.0) * 0.5)
+        return abs(t)
+    if spread == 2:                    # repeat
+        return t - math.floor(t)
+    return min(max(t, 0.0), 1.0)       # pad
+
+
+def rasterize_shape(shape, bitmap_pixels):
+    """Rasterize a parsed shape to (w, h, rgba_bytes) or None.
+
+    bitmap_pixels: callable(bmp_id) -> (w, h, rgba_bytes) or None.
+    """
+    xmin, xmax, ymin, ymax = shape["bounds"]
+    fills = shape["fills"]
+    lines = shape["lines"]
+    edges = shape["edges"]
+    if not edges:
+        return None
+
+    pad = 2.0
+    maxw = 0.0
+    for ln in lines:
+        if ln:
+            maxw = max(maxw, ln["width"])
+    pad += maxw * 0.5 + 1.0
+    w = int((xmax - xmin) / 20.0 + 2 * pad + 0.999)
+    h = int((ymax - ymin) / 20.0 + 2 * pad + 0.999)
+    if w <= 0 or h <= 0 or w * h > 40_000_000:
+        return None
+    ss = 2 if w * h <= 500_000 else 1
+
+    def to_px(pt):
+        return ((pt[0] - xmin) / 20.0 + pad, (pt[1] - ymin) / 20.0 + pad)
+
+    # --- build directed fill segments and stroke runs --------------------
+    segs_by_fill = {}
+    stroke_runs = []
+    cur_run = None                     # [line_idx, [pts]]
+    prev_end = None
+    tol = 0.3
+    for e in edges:
+        k = e["kind"]
+        if k == "move":
+            if cur_run is not None:
+                stroke_runs.append(cur_run)
+                cur_run = None
+            prev_end = None
+            continue
+        if k == "line":
+            flat = [to_px(e["pts"][0]), to_px(e["pts"][1])]
+        else:
+            p0, pc, p1 = (to_px(q) for q in e["pts"])
+            flat = [p0]
+            _flatten_quad(p0, pc, p1, tol, flat)
+        li = e["line"]
+        ls = lines[li] if 0 < li < len(lines) else None
+        if ls is not None:
+            if (cur_run is not None and cur_run[0] == li
+                    and prev_end is not None and prev_end == flat[0]):
+                cur_run[1].extend(flat[1:])
+            else:
+                if cur_run is not None:
+                    stroke_runs.append(cur_run)
+                cur_run = [li, ls, list(flat)]
+        f0, f1 = e["f0"], e["f1"]
+        todo = []
+        if f0 == f1:
+            if f0:
+                todo.append((f0, False))
+        else:
+            if f0:
+                todo.append((f0, False))
+            if f1:
+                todo.append((f1, True))
+        for f, rev in todo:
+            lst = segs_by_fill.setdefault(f, [])
+            for i in range(len(flat) - 1):
+                a, b = flat[i], flat[i + 1]
+                if rev:
+                    a, b = b, a
+                lst.append((a[0], a[1], b[0], b[1]))
+        prev_end = flat[-1]
+    if cur_run is not None:
+        stroke_runs.append(cur_run)
+
+    strokes = [(li, ls["width"], ls["paint"], pts)
+               for li, ls, pts in stroke_runs
+               if 0 < li < len(lines) and lines[li] is not None]
+
+    img = bytearray(w * h * 4)
+
+    # --- paint helpers ----------------------------------------------------
+    grad_cache = {}
+
+    def paint_at(style, px, py):
+        """Return (r, g, b, a01) for a fill style at device pixel."""
+        t = style["type"]
+        if t == "solid":
+            r, g, b, a = style["color"]
+            return r, g, b, a / 255.0
+        # shape-space point (twips)
+        sx = (px - pad) * 20.0 + xmin
+        sy = (py - pad) * 20.0 + ymin
+        if t == "grad":
+            u, v = _mat_apply(style["matrix"], sx, sy)
+            kind = style["kind"]
+            if kind == "linear":
+                tt = u
+            elif kind == "radial":
+                tt = math.sqrt(u * u + v * v)
+            else:  # focal
+                fx = style.get("focal", 0.0)
+                tt = math.sqrt((u - fx) * (u - fx) + v * v)
+            tt = _spread_t(tt, style["grad"]["spread"])
+            lut = grad_cache.get(id(style["grad"]))
+            if lut is None:
+                lut = _gradient_lut(style["grad"])
+                grad_cache[id(style["grad"])] = lut
+            r, g, b, a = lut[min(255, max(0, int(tt * 255.0)))]
+            return r, g, b, a / 255.0
+        if t == "bitmap":
+            bp = bitmap_pixels(style["bmp"])
+            if bp is None:
+                return 255, 0, 255, 1.0
+            bw, bh, bpx = bp
+            u, v = _mat_apply(style["matrix"], sx, sy)
+            if style.get("smooth"):
+                fx, fy = u - 0.5, v - 0.5
+                x0, y0 = int(math.floor(fx)), int(math.floor(fy))
+                tx, ty = fx - x0, fy - y0
+                acc = [0.0, 0.0, 0.0, 0.0]
+                for dy_ in (0, 1):
+                    for dx_ in (0, 1):
+                        wx = (1 - tx) if dx_ == 0 else tx
+                        wy = (1 - ty) if dy_ == 0 else ty
+                        wt = wx * wy
+                        xx = (x0 + dx_) % bw
+                        yy = (y0 + dy_) % bh
+                        o = (yy * bw + xx) * 4
+                        for k in range(4):
+                            acc[k] += bpx[o + k] * wt
+                return (min(255.0, acc[0]), min(255.0, acc[1]),
+                        min(255.0, acc[2]), min(1.0, acc[3] / 255.0))
+            xx = int(math.floor(u)) % bw
+            yy = int(math.floor(v)) % bh
+            o = (yy * bw + xx) * 4
+            return bpx[o], bpx[o + 1], bpx[o + 2], bpx[o + 3] / 255.0
+        return 0, 0, 0, 0.0
+
+    def composite(cov, style):
+        is_solid = style is not None and style.get("type") == "solid"
+        if is_solid:
+            r, g, b, a = style["color"]
+            sa0 = a / 255.0
+            for i in range(w * h):
+                c = cov[i]
+                if c <= 0.0:
+                    continue
+                sa = c * sa0
+                if sa <= 0.0:
+                    continue
+                d = i * 4
+                dr, dg, db, da = (img[d], img[d + 1], img[d + 2],
+                                  img[d + 3] / 255.0)
+                oa = sa + da * (1.0 - sa)
+                if oa <= 0.0:
+                    img[d:d + 4] = b"\x00\x00\x00\x00"
+                    continue
+                k = sa / oa
+                j = da * (1.0 - sa) / oa
+                img[d] = int(r * k + dr * j + 0.5)
+                img[d + 1] = int(g * k + dg * j + 0.5)
+                img[d + 2] = int(b * k + db * j + 0.5)
+                img[d + 3] = int(oa * 255.0 + 0.5)
+        else:
+            for y in range(h):
+                for x in range(w):
+                    c = cov[y * w + x]
+                    if c <= 0.0:
+                        continue
+                    r, g, b, sa1 = paint_at(style, x + 0.5, y + 0.5)
+                    sa = c * sa1
+                    if sa <= 0.0:
+                        continue
+                    d = (y * w + x) * 4
+                    dr, dg, db, da = (img[d], img[d + 1], img[d + 2],
+                                      img[d + 3] / 255.0)
+                    oa = sa + da * (1.0 - sa)
+                    if oa <= 0.0:
+                        img[d:d + 4] = b"\x00\x00\x00\x00"
+                        continue
+                    k = sa / oa
+                    j = da * (1.0 - sa) / oa
+                    img[d] = int(r * k + dr * j + 0.5)
+                    img[d + 1] = int(g * k + dg * j + 0.5)
+                    img[d + 2] = int(b * k + db * j + 0.5)
+                    img[d + 3] = int(oa * 255.0 + 0.5)
+
+    # fills in style order, then strokes on top
+    for fidx in sorted(segs_by_fill):
+        if fidx >= len(fills) or fills[fidx] is None:
+            continue
+        cov = _coverage(segs_by_fill[fidx], w, h, ss)
+        composite(cov, fills[fidx])
+
+    def line_paint_style(paint):
+        kind, val = paint
+        if kind == "solid":
+            return {"type": "solid", "color": val}
+        return val                       # ("fill", fillstyle_dict)
+
+    for li, width, paint, pts in strokes:
+        cov = _stroke_coverage([(width, pts)], w, h, ss)
+        composite(cov, line_paint_style(paint))
+
+    return w, h, bytes(img)
 
 
 # ---------------------------------------------------------------------------
@@ -384,6 +979,8 @@ class SwfParser:
         self._pending_jpegs = {}     # charId -> raw JPEG payload (tag 6)
         self.export_names = {}       # charId -> name
         self.metadata = None
+        self._png_cache = {}         # asset path -> decoded (w,h,rgba)
+        self._skipped_tags = {}      # tag code -> count (informational)
 
         self.version = 0
         self.frame_rate = 0.0
@@ -421,7 +1018,7 @@ class SwfParser:
         if sig == b"CWS":
             body = zlib.decompress(raw[8:])
         elif sig == b"ZWS":
-            raise NotImplementedError("ZWS (LZMA) SWF files are not supported")
+            body = lzma.decompress(raw[8:])
         elif sig == b"FWS":
             body = raw[8:]
         else:
@@ -545,11 +1142,16 @@ class SwfParser:
             self.warnings.append("DefineBitsJPEG4 encountered; skipped")
             return
         if code in (2, 22, 32, 83):   # DefineShape / 2 / 3 / 4
-            res = scan_shape(code, p)
-            if res:
-                sid, w, h, bitmaps = res
-                self.chars[sid] = {"kind": "shape", "w": w, "h": h,
-                                   "bitmaps": bitmaps}
+            shape = parse_shape(code, p)
+            if shape:
+                sid = shape["sid"]
+                b = shape["bounds"]
+                entry = {"kind": "shape", "shape": shape,
+                         "w": (b[1] - b[0]) / 20.0, "h": (b[3] - b[2]) / 20.0,
+                         "bitmaps": self._shape_bitmap_ids(shape)}
+                self.chars[sid] = entry
+            else:
+                self.warnings.append(f"shape tag {code}: parse failed")
             return
 
         if code == 14:     # DefineSound
@@ -612,6 +1214,7 @@ class SwfParser:
                     f.write(p[4:])
             return
         # shapes, fonts, buttons, actions etc. are intentionally skipped
+        self._skipped_tags[code] = self._skipped_tags.get(code, 0) + 1
 
     # -- PlaceObject --------------------------------------------------------
 
@@ -619,24 +1222,52 @@ class SwfParser:
     def _identity_matrix():
         return {"tx": 0, "ty": 0, "sx": 1.0, "sy": 1.0, "k0": 0.0, "k1": 0.0}
 
-    def _apply_place(self, depth, char_id, matrix, name, is_move):
+    @staticmethod
+    def _shape_bitmap_ids(shape):
+        """Bitmap character ids referenced by a parsed shape's styles."""
+        ids = []
+
+        def scan_fill(fs):
+            if not fs:
+                return
+            if fs.get("type") == "bitmap":
+                ids.append(fs["bmp"])
+
+        for fs in shape["fills"]:
+            scan_fill(fs)
+        for ls in shape["lines"]:
+            if not ls:
+                continue
+            kind, val = ls.get("paint", (None, None))
+            if kind == "fill":
+                scan_fill(val)
+        return ids
+
+    def _apply_place(self, depth, char_id, matrix, name, is_move,
+                     cxform=None, visible=None):
         old = self._display.get(depth)
-        if is_move and char_id is None and old is not None:
-            old["x"] = matrix["tx"] / 20.0
-            old["y"] = matrix["ty"] / 20.0
-            old["sx"], old["sy"] = matrix["sx"], matrix["sy"]
+        if is_move and old is not None:
+            if matrix is not None:
+                old["m"] = matrix
+            if cxform is not None:
+                old["cx"] = cxform
             if name:
                 old["name"] = name
+            if visible is not None:
+                old["vis"] = visible
+            if char_id is not None:
+                old["charId"] = char_id
             return
         entry = {
             "depth": depth,
             "charId": char_id if char_id is not None
                       else (old or {}).get("charId"),
             "name": name or (old or {}).get("name"),
-            "x": matrix["tx"] / 20.0,
-            "y": matrix["ty"] / 20.0,
-            "sx": matrix["sx"],
-            "sy": matrix["sy"],
+            "m": matrix if matrix is not None
+                 else (old or {}).get("m") or self._identity_matrix(),
+            "cx": cxform if cxform is not None else (old or {}).get("cx"),
+            "vis": visible if visible is not None
+                   else (old or {}).get("vis", True),
             "isMove": is_move,
         }
         self._display[depth] = entry
@@ -683,14 +1314,15 @@ class SwfParser:
         if has_char:
             char_id = struct.unpack_from("<H", p, off)[0]
             off += 2
-        matrix = self._identity_matrix()
+        matrix = None
         if has_matrix:
             br = BitReader(p[off:])
             matrix = read_matrix(br)
             off += br.byte_len()
+        cxform = None
         if has_color_transform:
             br = BitReader(p[off:])
-            read_cxform_with_alpha(br)
+            cxform = read_cxform(br, alpha=True)
             off += br.byte_len()
         if has_ratio:
             off += 2
@@ -702,7 +1334,8 @@ class SwfParser:
         if has_clip_actions:
             off = self._skip_clip_actions(p, off, self.version >= 6)
 
-        self._apply_place(depth, char_id, matrix, name, bool(is_move))
+        self._apply_place(depth, char_id, matrix, name, bool(is_move),
+                          cxform=cxform)
 
     def _place_object3(self, p):
         if len(p) < 4:
@@ -733,14 +1366,15 @@ class SwfParser:
         if has_char:
             char_id = struct.unpack_from("<H", p, off)[0]
             off += 2
-        matrix = self._identity_matrix()
+        matrix = None
         if has_matrix:
             br = BitReader(p[off:])
             matrix = read_matrix(br)
             off += br.byte_len()
+        cxform = None
         if has_color_transform:
             br = BitReader(p[off:])
-            read_cxform_with_alpha(br)
+            cxform = read_cxform(br, alpha=True)
             off += br.byte_len()
         if has_ratio:
             off += 2
@@ -749,23 +1383,31 @@ class SwfParser:
             name, off = read_cstring(p, off)
         if has_clip_depth:
             off += 2
+        visible = None
         if has_filters:
-            # FilterList records are variable-length; precise skipping is
-            # complex, so drop this placement rather than corrupt the frame.
-            self.warnings.append("PlaceObject3 with filters skipped")
+            # FilterList records are variable-length and rare; skip the
+            # rest of this record's optional fields but keep the placement
+            # (drawing it unfiltered is a better approximation than
+            # dropping the object entirely).
+            if "PlaceObject3 with filters" not in self.warnings:
+                self.warnings.append("PlaceObject3 with filters skipped")
+            self._apply_place(depth, char_id, matrix, name, bool(is_move),
+                              cxform=cxform)
             return
         if has_blend:
             off += 1
         if has_cache:
             off += 1
         if has_visibility:
+            visible = bool(p[off])
             off += 1
         if has_bg:
             off += 4
         if has_clip_actions:
             off = self._skip_clip_actions(p, off, self.version >= 6)
 
-        self._apply_place(depth, char_id, matrix, name, bool(is_move))
+        self._apply_place(depth, char_id, matrix, name, bool(is_move),
+                          cxform=cxform, visible=visible)
 
     # -- sprites ------------------------------------------------------------
 
@@ -887,6 +1529,53 @@ class SwfParser:
         except Exception:
             pass
 
+    # -- bitmaps / shape rasterization ---------------------------------------
+
+    def _bitmap_pixels(self, bmp_id):
+        """RGBA pixels for a bitmap character, or None if unavailable."""
+        if bmp_id in self._png_cache:
+            return self._png_cache[bmp_id]
+        res = None
+        info = self.chars.get(bmp_id)
+        if info and info.get("kind") == "image" and info.get("ext") == "png":
+            try:
+                path = os.path.join(self.out_assets, "images",
+                                    info["file"])
+                with open(path, "rb") as f:
+                    res = decode_png_rgba(f.read())
+            except Exception:
+                res = None
+        self._png_cache[bmp_id] = res
+        return res
+
+    def _rasterize_shapes(self):
+        n_done = 0
+        for cid, info in list(self.chars.items()):
+            if info.get("kind") != "shape" or "shape" not in info:
+                continue
+            try:
+                res = rasterize_shape(info["shape"], self._bitmap_pixels)
+            except Exception as e:
+                res = None
+                self.warnings.append(f"shape {cid}: rasterize error: {e}")
+            if res is None:
+                continue
+            w, h, rgba = res
+            raw = bytearray(h * (w * 4 + 1))
+            for y in range(h):
+                row = y * (w * 4 + 1)
+                raw[row + 1:row + 1 + w * 4] = rgba[y * w * 4:(y + 1) * w * 4]
+            png = _png_bytes(w, h, 6, bytes(raw))
+            fname = f"shape_{cid}.png"
+            with open(os.path.join(self.out_assets, "images", fname),
+                      "wb") as f:
+                f.write(png)
+            self.chars[cid] = {"kind": "image", "file": fname, "ext": "png",
+                               "w": w, "h": h}
+            n_done += 1
+        if n_done:
+            self.warnings.append(f"rasterized {n_done} vector shapes")
+
     # -- finalisation ---------------------------------------------------------
 
     def finish(self):
@@ -911,6 +1600,30 @@ class SwfParser:
         for cid, name in self.export_names.items():
             if cid in self.chars:
                 self.chars[cid]["name"] = name
+
+        self._rasterize_shapes()
+
+        if self._skipped_tags:
+            names = {0: "End", 1: "ShowFrame", 7: "DefineButton",
+                     9: "SetBackgroundColor", 10: "DefineFont",
+                     11: "DefineText", 12: "DoAction", 13: "DefineFontInfo",
+                     17: "DefineButtonCxform", 24: "Protect",
+                     33: "DefineText2", 34: "DefineButton2",
+                     37: "DefineEditText", 43: "FrameLabel",
+                     46: "DefineMorphShape", 48: "DefineFont2",
+                     59: "DoInitAction", 64: "EnableDebugger2",
+                     69: "FileAttributes", 72: "DoABC", 73: "DefineShape?",
+                     74: "DefineScene?", 75: "DefineBinaryData?",
+                     82: "DoABC", 84: "DefineMorphShape2",
+                     86: "SceneAndFrameLabelData", 87: "DefineBinaryData",
+                     88: "DefineFontName", 89: "StartSound2",
+                     90: "DefineBitsJPEG4"}
+            parts = []
+            for code, n in sorted(self._skipped_tags.items()):
+                nm = names.get(code, f"tag{code}")
+                parts.append(f"{nm}x{n}")
+            self.warnings.append(
+                "unsupported tags ignored: " + ", ".join(parts))
 
         return {
             "version": self.version,
@@ -938,22 +1651,32 @@ class SwfParser:
 
     def _serialize_frames(self, frames):
         out = []
+        ident = self._identity_matrix()
         for frame in frames:
             items = []
             for pl in frame:
+                if pl.get("vis") is False:
+                    continue
                 cid = pl.get("charId")
                 info = self.chars.get(cid, {}) if cid is not None else {}
                 kind = info.get("kind", "unknown")
+                m = pl.get("m") or ident
                 entry = {
                     "depth": pl["depth"],
                     "charId": cid,
                     "kind": kind,
                     "name": pl.get("name") or info.get("name"),
-                    "x": round(pl["x"], 2),
-                    "y": round(pl["y"], 2),
-                    "scaleX": round(pl.get("sx", 1.0), 4),
-                    "scaleY": round(pl.get("sy", 1.0), 4),
+                    "a": round(m["sx"], 5), "b": round(m["k1"], 5),
+                    "c": round(m["k0"], 5), "d": round(m["sy"], 5),
+                    "e": round(m["tx"] / 20.0, 3),
+                    "f": round(m["ty"] / 20.0, 3),
                 }
+                cx = pl.get("cx")
+                if cx:
+                    entry["mr"], entry["mg"], entry["mb"], entry["ma"] = \
+                        [round(v, 5) for v in cx[0]]
+                    entry["ar"], entry["ag"], entry["ab"], entry["aa"] = \
+                        [round(v, 5) for v in cx[1]]
                 if kind == "image" and info.get("file"):
                     entry["file"] = "assets/images/" + info["file"]
                 elif kind == "sprite":
@@ -961,9 +1684,8 @@ class SwfParser:
                 elif kind == "sound" and info.get("file"):
                     entry["file"] = "assets/" + info["file"]
                 items.append(entry)
-                # Approximation: a placed vector shape is drawn as each of
-                # its bitmap fill images (fills are the only raster content
-                # we can reproduce without a full SWF renderer).
+                # Fallback for shapes that failed to rasterize: draw each
+                # referenced bitmap stretched over the shape bounds.
                 if kind == "shape":
                     for bmp in info.get("bitmaps", []):
                         binfo = self.chars.get(bmp, {})
@@ -973,11 +1695,12 @@ class SwfParser:
                                 "charId": bmp,
                                 "kind": "image",
                                 "name": pl.get("name") or info.get("name"),
-                                "x": entry["x"], "y": entry["y"],
-                                "scaleX": entry["scaleX"],
-                                "scaleY": entry["scaleY"],
+                                "a": entry["a"], "b": entry["b"],
+                                "c": entry["c"], "d": entry["d"],
+                                "e": entry["e"], "f": entry["f"],
                                 "file": "assets/images/" + binfo["file"],
                             })
+            items.sort(key=lambda it: it.get("depth", 0))
             out.append(items)
         return out
 
@@ -986,158 +1709,67 @@ class SwfParser:
 # C++ project generation
 # ---------------------------------------------------------------------------
 
-CPP_MAIN = r'''// Generated by swf_to_cpp.py — do not edit by hand.
-// Re-run the converter to regenerate this file.
-//
-// NOTE: This skeleton replays the extracted SWF timeline (bitmap and
-// sprite placements per frame). ActionScript logic, vector shapes and
-// fonts are NOT translated — port interaction/gameplay manually.
-
-#include <SFML/Audio.hpp>
-#include <SFML/Graphics.hpp>
-
-#include <algorithm>
-#include <iostream>
-#include <memory>
-#include <string>
-#include <unordered_map>
-#include <vector>
-
-#include "timeline_data.h"
-
-namespace {
-
-sf::Texture& getTexture(const std::string& path,
-                        std::unordered_map<std::string, sf::Texture>& cache) {
-    auto it = cache.find(path);
-    if (it != cache.end()) return it->second;
-    sf::Texture tex;
-    if (!tex.loadFromFile(path)) {
-        std::cerr << "warning: could not load texture " << path << "\n";
-        sf::Image img;
-        img.create(1, 1, sf::Color::Magenta);  // placeholder
-        tex.loadFromImage(img);
-    }
-    tex.setSmooth(true);
-    auto res = cache.emplace(path, std::move(tex));
-    return res.first->second;
-}
-
-sf::SoundBuffer& getSound(const std::string& path,
-                          std::unordered_map<std::string, sf::SoundBuffer>& cache) {
-    auto it = cache.find(path);
-    if (it != cache.end()) return it->second;
-    sf::SoundBuffer buf;
-    if (!buf.loadFromFile(path)) {
-        std::cerr << "warning: could not load sound " << path << "\n";
-    }
-    auto res = cache.emplace(path, std::move(buf));
-    return res.first->second;
-}
-
-void drawItem(const DrawItem& item, const SpriteTable& sprites,
-              sf::RenderWindow& window,
-              std::unordered_map<std::string, sf::Texture>& texCache,
-              int frameIndex, int depth) {
-    if (depth > 8) return;
-    if (item.spriteId >= 0) {
-        const SpriteDef* def = sprites.find(item.spriteId);
-        if (!def) return;
-        int f = frameIndex % def->frameCount;
-        const FrameView& fv = def->frames[f];
-        for (int j = 0; j < fv.count; ++j) {
-            DrawItem child = fv.items[j];
-            child.x += item.x;
-            child.y += item.y;
-            drawItem(child, sprites, window, texCache, frameIndex, depth + 1);
-        }
-        return;
-    }
-    if (!item.file || !item.file[0]) return;
-    sf::Texture& tex = getTexture(item.file, texCache);
-    sf::Sprite sprite(tex);
-    sprite.setPosition(item.x, item.y);
-    sprite.setScale(item.scaleX, item.scaleY);
-    window.draw(sprite);
-}
-
-} // namespace
-
-int main() {
-    const TimelineInfo& info = timelineInfo();
-    SpriteTable sprites;
-
-    sf::RenderWindow window(
-        sf::VideoMode(static_cast<unsigned>(info.width),
-                      static_cast<unsigned>(info.height)),
-        "SWF to C++ player", sf::Style::Close);
-    window.setFramerateLimit(info.frameRate);
-
-    std::unordered_map<std::string, sf::Texture> texCache;
-    std::unordered_map<std::string, sf::SoundBuffer> sndCache;
-    std::vector<std::unique_ptr<sf::Sound>> activeSounds;
-
-    std::size_t frame = 0;
-    std::size_t cueIndex = 0;
-
-    while (window.isOpen()) {
-        sf::Event event;
-        while (window.pollEvent(event)) {
-            if (event.type == sf::Event::Closed) window.close();
-            if (event.type == sf::Event::KeyPressed &&
-                event.key.code == sf::Keyboard::Escape)
-                window.close();
-        }
-
-        if (frame >= static_cast<std::size_t>(info.frameCount)) {
-            frame = 0;
-            cueIndex = 0;
-        }
-
-        // play sound cues scheduled for this frame
-        while (cueIndex < static_cast<std::size_t>(info.soundCount) &&
-               info.sounds[cueIndex].frame == static_cast<int>(frame)) {
-            auto snd = std::make_unique<sf::Sound>();
-            snd->setBuffer(getSound(info.sounds[cueIndex].file, sndCache));
-            snd->play();
-            activeSounds.push_back(std::move(snd));
-            ++cueIndex;
-        }
-        activeSounds.erase(
-            std::remove_if(activeSounds.begin(), activeSounds.end(),
-                           [](const std::unique_ptr<sf::Sound>& s) {
-                               return s->getStatus() == sf::Sound::Stopped;
-                           }),
-            activeSounds.end());
-
-        window.clear(sf::Color(info.bgR, info.bgG, info.bgB));
-
-        const FrameView& fv = info.frames[frame];
-        for (int j = 0; j < fv.count; ++j) {
-            drawItem(fv.items[j], sprites, window, texCache,
-                     static_cast<int>(frame), 0);
-        }
-
-        window.display();
-        ++frame;
-    }
-    return 0;
-}
-'''
-
 CPP_CMAKE = r'''cmake_minimum_required(VERSION 3.16)
 project(swf_player CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-find_package(SFML 2.5 REQUIRED COMPONENTS graphics audio window system)
+file(GLOB PLAYER_SOURCES CONFIGURE_DEPENDS src/*.cpp)
+add_executable(swf_player ${PLAYER_SOURCES})
+target_include_directories(swf_player PRIVATE src src/vendor)
 
-add_executable(swf_player src/main.cpp src/timeline_data.cpp)
-target_include_directories(swf_player PRIVATE src)
-target_link_libraries(swf_player PRIVATE
-    sfml-graphics sfml-audio sfml-window sfml-system)
+if(WIN32)
+    target_link_libraries(swf_player PRIVATE gdi32 user32)
+else()
+    find_package(X11 REQUIRED)
+    target_link_libraries(swf_player PRIVATE X11)
+endif()
 '''
+
+BUILD_SH = r'''#!/bin/sh
+# Build the generated SWF player on Linux.
+set -e
+cd "$(dirname "$0")"
+mkdir -p build
+cd build
+cmake ..
+cmake --build . -j"$(nproc 2>/dev/null || echo 4)"
+echo "Built: build/swf_player"
+echo "Run:   ./build/swf_player            (windowed)"
+echo "       ./build/swf_player --frames 30 (headless PNG export)"
+'''
+
+BUILD_BAT = r'''@echo off
+rem Build the generated SWF player on Windows.
+setlocal
+cd /d "%~dp0"
+if not exist build mkdir build
+cd build
+cmake .. -G "Visual Studio 17 2022" -A x64 2>nul || cmake ..
+cmake --build . --config Release
+if errorlevel 1 (
+    echo Build failed.
+    exit /b 1
+)
+echo Built: build\Release\swf_player.exe
+echo Run:   build\Release\swf_player.exe
+endlocal
+'''
+
+# Source files copied verbatim from this repo's templates/ and vendor/
+# directories into the generated project so it is fully self-contained.
+PLAYER_TEMPLATE_FILES = [
+    "main.cpp", "platform.h", "platform_x11.cpp", "platform_win32.cpp",
+    "audio.h", "audio.cpp", "swfrender.h", "swfrender.cpp",
+]
+PLAYER_VENDOR_FILES = [
+    "stb_image.h", "stb_image_write.h", "minimp3.h", "miniaudio.h",
+]
+
+
+def _repo_dir():
+    return os.path.dirname(os.path.abspath(__file__))
 
 
 def _cpp_str(s):
@@ -1153,8 +1785,21 @@ def _draw_item_init(it):
     if it.get("kind") == "sprite":
         file = ""
         spr = it.get("charId", -1)
+    m = it
+    color = [it.get(k, d) for k, d in
+             (("mr", 1.0), ("mg", 1.0), ("mb", 1.0), ("ma", 1.0),
+              ("ar", 0.0), ("ag", 0.0), ("ab", 0.0), ("aa", 0.0))]
+    has_cx = 1 if "mr" in it else 0
+    def fv(v):
+        return f"{float(v)}f"
     return ("{" + _cpp_str(file) + f", {spr}, "
-            f"{it['x']}f, {it['y']}f, {it['scaleX']}f, {it['scaleY']}f}}")
+            "{%s,%s,%s,%s,%s,%s}, {%s,%s,%s,%s,%s,%s,%s,%s}, "
+            "%s}" % (
+                fv(m.get("a", 1.0)), fv(m.get("b", 0.0)),
+                fv(m.get("c", 0.0)), fv(m.get("d", 1.0)),
+                fv(m.get("e", 0.0)), fv(m.get("f", 0.0)),
+                *(fv(v) for v in color),
+                "true" if has_cx else "false"))
 
 
 def generate_timeline_files(timeline, header_path, source_path):
@@ -1172,8 +1817,9 @@ def generate_timeline_files(timeline, header_path, source_path):
     h.append("struct DrawItem {")
     h.append("    const char* file;   // asset path, nullptr/\"\" if none")
     h.append("    int spriteId;       // >=0 -> draw sprite instead of file")
-    h.append("    float x, y;")
-    h.append("    float scaleX, scaleY;")
+    h.append("    float matrix[6];    // a,b,c,d,e,f affine transform")
+    h.append("    float color[8];     // mr,mg,mb,ma, ar,ag,ab,aa")
+    h.append("    bool hasCx;         // color transform present")
     h.append("};")
     h.append("")
     h.append("struct FrameView { const DrawItem* items; int count; };")
@@ -1330,14 +1976,30 @@ def generate_timeline_files(timeline, header_path, source_path):
 
 def write_project(timeline, out_dir):
     src = os.path.join(out_dir, "src")
+    vendor_out = os.path.join(src, "vendor")
     os.makedirs(src, exist_ok=True)
+    os.makedirs(vendor_out, exist_ok=True)
     with open(os.path.join(out_dir, "CMakeLists.txt"), "w") as f:
         f.write(CPP_CMAKE)
-    with open(os.path.join(src, "main.cpp"), "w") as f:
-        f.write(CPP_MAIN)
+
+    # copy the self-contained player sources + vendored single-header libs
+    repo = _repo_dir()
+    for name in PLAYER_TEMPLATE_FILES:
+        shutil.copyfile(os.path.join(repo, "templates", name),
+                        os.path.join(src, name))
+    for name in PLAYER_VENDOR_FILES:
+        shutil.copyfile(os.path.join(repo, "vendor", name),
+                        os.path.join(vendor_out, name))
+
     generate_timeline_files(timeline,
                             os.path.join(src, "timeline_data.h"),
                             os.path.join(src, "timeline_data.cpp"))
+
+    with open(os.path.join(out_dir, "build.sh"), "w") as f:
+        f.write(BUILD_SH)
+    os.chmod(os.path.join(out_dir, "build.sh"), 0o755)
+    with open(os.path.join(out_dir, "build.bat"), "w") as f:
+        f.write(BUILD_BAT)
 
     with open(os.path.join(out_dir, "README.generated.md"), "w") as f:
         f.write(f"""# Generated SWF player
@@ -1345,18 +2007,41 @@ def write_project(timeline, out_dir):
 Source: `{timeline['source']}` ({int(timeline['frameCount'])} frames @
 {timeline['frameRate']} fps, {int(timeline['width'])}x{int(timeline['height'])} px)
 
-## Build
+Self-contained native player: software renderer, X11 (Linux) / Win32
+(Windows) window, WAV+MP3 audio. No SFML or other system libraries are
+required beyond a C++17 compiler and (on Linux) libX11.
 
-    mkdir build && cd build
-    cmake .. -DCMAKE_PREFIX_PATH=/path/to/sfml
-    cmake --build .
+## Build — Linux
 
-Requires SFML 2.x (graphics, audio, window, system components).
-See the main project README for install instructions.
+    ./build.sh            # or: mkdir build && cd build && cmake .. && make
 
-Run from the project root so `assets/` resolves:
+Requires: g++ or clang++, cmake >= 3.16, libx11-dev (X11 headers).
+
+## Build — Windows
+
+    build.bat             # or open CMakeLists.txt in your IDE
+
+Requires: Visual Studio 2019+ or MinGW-w64 with cmake on PATH.
+Produces `build\\Release\\swf_player.exe`.
+
+## Run
+
+Run from the project root so `assets/` resolves (or from anywhere — the
+player also searches next to the executable):
 
     ./build/swf_player
+
+Headless frame export (useful for CI / machines without a display):
+
+    ./build/swf_player --frames 120 --frames-dir out/
+
+Controls: Space pause, R restart, P pause, Esc quit.
+
+## Limitations
+
+ActionScript is not translated; fonts, morph shapes, blend modes and
+bitmap filters are approximated or skipped (see `timeline.json`
+`warnings` for details of this conversion).
 """)
 
     with open(os.path.join(out_dir, "timeline.json"), "w") as f:
@@ -1370,7 +2055,8 @@ Run from the project root so `assets/` resolves:
 
 def main(argv=None):
     ap = argparse.ArgumentParser(
-        description="Convert a .swf file into a C++/SFML project skeleton.")
+        description="Convert a .swf file into a self-contained native "
+                    "C++ player project (Linux/Windows).")
     ap.add_argument("input", help="input .swf file")
     ap.add_argument("output_dir", help="output directory for the project")
     ap.add_argument("--quiet", action="store_true", help="less output")

@@ -76,8 +76,49 @@ def matrix(tx=0, ty=0):
     return bw.bytes()
 
 
-def place_object2(depth, char_id, tx, ty, name=None, move=False):
+def matrix_full(sx=1.0, sy=1.0, k0=0.0, k1=0.0, tx=0, ty=0):
+    """MATRIX record with scale and/or rotate/skew (16.16 fixed)."""
+    bw = BitWriter()
+    bw.w(1, 1)                      # has scale
+    svals = [int(round(sx * 65536)), int(round(sy * 65536))]
+    n = max(max(v.bit_length() + 1 for v in svals), 1)
+    bw.w(n, 5)
+    for v in svals:
+        bw.ws(v, n)
+    if k0 or k1:
+        bw.w(1, 1)                  # has rotate/skew
+        kvals = [int(round(k0 * 65536)), int(round(k1 * 65536))]
+        n = max(max(v.bit_length() + 1 for v in kvals), 1)
+        bw.w(n, 5)
+        for v in kvals:
+            bw.ws(v, n)
+    else:
+        bw.w(0, 1)
+    nt = max(tx.bit_length() + 1, ty.bit_length() + 1, 1)
+    bw.w(nt, 5)
+    bw.ws(tx, nt)
+    bw.ws(ty, nt)
+    return bw.bytes()
+
+
+def cxform_with_alpha(alpha_mult=128):
+    """CXFORMWITHALPHA: identity RGB mult, alpha scaled by alpha_mult/256."""
+    bw = BitWriter()
+    bw.w(0, 1)          # hasAddTerms = 0
+    bw.w(1, 1)          # hasMultTerms = 1
+    vals = [256, 256, 256, alpha_mult]
+    nbits = max(v.bit_length() + 1 for v in vals)
+    bw.w(nbits, 4)
+    for v in vals:
+        bw.ws(v, nbits)
+    return bw.bytes()
+
+
+def place_object2(depth, char_id, tx=0, ty=0, name=None, move=False,
+                  matrix_bytes=None, cxform=None):
     flags = 0x02 | 0x04          # has character + has matrix
+    if cxform is not None:
+        flags |= 0x08            # has color transform
     if name is not None:
         flags |= 0x20
     if move:
@@ -85,10 +126,59 @@ def place_object2(depth, char_id, tx, ty, name=None, move=False):
     p = bytes([flags]) + struct.pack("<H", depth)
     if char_id is not None:
         p += struct.pack("<H", char_id)
-    p += matrix(tx, ty)
+    p += matrix_bytes if matrix_bytes is not None else matrix(tx, ty)
+    if cxform is not None:
+        p += cxform
     if name is not None:
         p += name.encode() + b"\x00"
     return tag(26, p)
+
+
+def define_shape_square(sid, size_twips, rgb):
+    """DefineShape: SHAPEWITHSTYLE layout (arrays, then bit counts)."""
+    body = struct.pack("<H", sid) + rect(0, size_twips, 0, size_twips)
+    # FILLSTYLEARRAY: 1 solid RGB fill (v1 colors have no alpha)
+    body += bytes([1, 0x00]) + bytes(rgb)
+    # LINESTYLEARRAY: empty
+    body += bytes([0])
+    bw = BitWriter()
+    bw.w(1, 4)              # NumFillBits
+    bw.w(1, 4)              # NumLineBits
+    body += bw.bytes()
+
+    # SHAPERECORDS
+    rb = BitWriter()
+    # record 1: state record selecting Fill0Style = 1
+    rb.w(0, 1)
+    rb.w(0, 1)              # StateNewStyles
+    rb.w(0, 1)              # LineStyleFlag
+    rb.w(0, 1)              # Fill1StyleFlag
+    rb.w(1, 1)              # Fill0StyleFlag
+    rb.w(0, 1)              # MoveToFlag
+    rb.w(1, 1)              # Fill0Style index (1 bit) = 1
+
+    # four straight edges returning to origin; NumBits field = bits-2
+    nbits = size_twips.bit_length() + 1
+    field = nbits - 2
+    def edge(dx, dy, vertical):
+        rb.w(1, 1)          # edge record
+        rb.w(1, 1)          # straight
+        rb.w(field, 4)
+        rb.w(0, 1)          # general line flag = 0
+        rb.w(1 if vertical else 0, 1)
+        if vertical:
+            rb.ws(dy, nbits)
+        else:
+            rb.ws(dx, nbits)
+    edge(size_twips, 0, False)
+    edge(0, size_twips, True)
+    edge(-size_twips, 0, False)
+    edge(0, -size_twips, True)
+    # EndShapeRecord: state record with all flags clear (6 zero bits)
+    rb.w(0, 1)
+    rb.w(0, 5)
+    body += rb.bytes()
+    return tag(2, body)
 
 
 def define_bits_lossless2(char_id, w, h, pixels_argb):
@@ -121,6 +211,8 @@ def main(out_path):
     tags = []
     tags.append(tag(9, bytes((255, 255, 255))))         # bg white
     tags.append(define_bits_lossless2(1, W, H, bytes(px)))
+    # char 3: vector shape (solid red 200x200 px square) for shape rasterizer
+    tags.append(define_shape_square(3, 4000, (255, 0, 0)))
     # sprite id=2, 2 frames: image at x=0 and x=40 (twips*20 -> px? we use
     # twips: 40 twips = 2px... use 200 twips = 10px)
     sprite = define_sprite(2, 2, [
@@ -133,6 +225,13 @@ def main(out_path):
     # main timeline: 3 frames
     tags.append(place_object2(1, 2, 20, 20, name="hero"))   # sprite at 1,1px
     tags.append(place_object2(2, 1, 150, 150))              # bitmap at 7.5px
+    # char 3: semi-transparent (alpha cxform) at 150,150 px
+    tags.append(place_object2(3, 3, 3000, 3000,
+                              cxform=cxform_with_alpha(128)))
+    # char 1 again: 2x scaled + placed via full matrix
+    tags.append(place_object2(4, 1, 0, 0,
+                              matrix_bytes=matrix_full(
+                                  sx=2.0, sy=2.0, tx=3900, ty=200)))
     tags.append(tag(1, b""))
     tags.append(tag(1, b""))                                # frame 2 (no change)
     tags.append(tag(43, b"final frame\x00"))
