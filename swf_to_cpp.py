@@ -499,6 +499,14 @@ def parse_shape(tag_id, p):
         xmin, xmax, ymin, ymax = read_rect(br)
         br.align()
         off = 2 + br.byte_len()
+        if version == 4:
+            # DefineShape4 (SHAPE4): a second RECT (edgeBounds) followed
+            # by 8 flag bits (5 reserved + fillWinding + nonScaling +
+            # scaling strokes) precede the style arrays.
+            br = BitReader(p[off:])
+            read_rect(br)
+            br.align()
+            off += br.byte_len() + 1
         # SHAPEWITHSTYLE (all DefineShape* tags): style arrays precede
         # the 4+4 bit style-index counts.
         fills, off = _read_style_array(p, off, version, "fill")
@@ -831,7 +839,7 @@ def rasterize_shape(shape, bitmap_pixels):
         if ls is not None:
             if (cur_run is not None and cur_run[0] == li
                     and prev_end is not None and prev_end == flat[0]):
-                cur_run[1].extend(flat[1:])
+                cur_run[2].extend(flat[1:])
             else:
                 if cur_run is not None:
                     stroke_runs.append(cur_run)
