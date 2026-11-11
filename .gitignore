@@ -14,3 +14,7 @@ Makefile
 # Python
 __pycache__/
 *.pyc
+
+# Generated conversion output (local use)
+exports/
+export_ult/

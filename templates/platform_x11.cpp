@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstring>
 #include <unordered_map>
+#include <vector>
 
 namespace {
 
@@ -39,14 +40,17 @@ public:
 
         visual_ = DefaultVisual(display_, screen_);
         depth_ = DefaultDepth(display_, screen_);
+        // request 32-bit TrueColor; XCreateImage does not allocate the
+        // pixel buffer, so provide our own
+        imgBuf_.assign(static_cast<size_t>(w) * h * 4, 0);
         ximage_ = XCreateImage(display_, visual_, depth_, ZPixmap, 0,
-                               nullptr, w, h, 32,
+                               reinterpret_cast<char*>(imgBuf_.data()),
+                               w, h, 32,
                                static_cast<int>(w) * 4);
         if (!ximage_) {
             destroy();
             return false;
         }
-        // request 32-bit TrueColor; masks are filled in on first present
         w_ = w;
         h_ = h;
         XFlush(display_);
@@ -83,13 +87,19 @@ public:
 
     bool poll() override {
         if (!display_) return false;
+        edges_.clear();
         while (XPending(display_)) {
             XEvent ev;
             XNextEvent(display_, &ev);
             if (ev.type == KeyPress || ev.type == KeyRelease) {
                 KeySym ks = XLookupKeysym(&ev.xkey, 0);
                 int code = mapKeysym(ks);
-                if (code) keys_[code] = (ev.type == KeyPress);
+                if (code) {
+                    bool down = (ev.type == KeyPress);
+                    // edge-trigger: ignore autorepeat KeyPress events
+                    if (down && !keys_[code]) edges_[code] = true;
+                    keys_[code] = down;
+                }
             } else if (ev.type == Expose) {
                 // repaint handled by caller's next present
             } else if (ev.type == ClientMessage) {
@@ -108,8 +118,7 @@ public:
     int height() const override { return h_; }
 
     bool keyPressed(int code) const override {
-        auto it = keys_.find(code);
-        return it != keys_.end() && it->second;
+        return edges_.find(code) != edges_.end();
     }
 
 private:
@@ -133,12 +142,14 @@ private:
     Window window_ = 0;
     GC gc_ = nullptr;
     XImage* ximage_ = nullptr;
+    std::vector<uint8_t> imgBuf_;
     Visual* visual_ = nullptr;
     int screen_ = 0;
     int depth_ = 0;
     int w_ = 0, h_ = 0;
     bool closed_ = false;
     std::unordered_map<int, bool> keys_;
+    std::unordered_map<int, bool> edges_;   // presses since last poll()
 };
 
 } // namespace

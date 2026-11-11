@@ -68,6 +68,7 @@ public:
     }
 
     bool poll() override {
+        edges_.clear();
         MSG msg;
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
             if (msg.message == WM_QUIT) {
@@ -84,8 +85,7 @@ public:
     int height() const override { return h_; }
 
     bool keyPressed(int code) const override {
-        auto it = keys_.find(code);
-        return it != keys_.end() && it->second;
+        return edges_.find(code) != edges_.end();
     }
 
 private:
@@ -123,7 +123,13 @@ private:
         case WM_KEYUP:
             if (self) {
                 int code = mapKey(static_cast<int>(wp));
-                if (code) self->keys_[code] = (msg == WM_KEYDOWN);
+                if (code) {
+                    bool down = (msg == WM_KEYDOWN);
+                    // edge-trigger: ignore autorepeat WM_KEYDOWN
+                    if (down && !self->keys_[code])
+                        self->edges_[code] = true;
+                    self->keys_[code] = down;
+                }
             }
             break;
         case WM_CLOSE:
@@ -144,8 +150,8 @@ private:
         case VK_RIGHT: return KEY_RIGHT;
         case VK_UP: return KEY_UP;
         case VK_DOWN: return KEY_DOWN;
-        case VK_P: return KEY_P;
-        case VK_R: return KEY_R;
+        case 'P': return KEY_P;   // VK 'P' = 0x50 (no VK_P macro exists)
+        case 'R': return KEY_R;   // VK 'R' = 0x52
         }
         return KEY_NONE;
     }
@@ -155,6 +161,7 @@ private:
     bool closed_ = false;
     const uint32_t* lastPixels_ = nullptr;
     std::unordered_map<int, bool> keys_;
+    std::unordered_map<int, bool> edges_;   // presses since last poll()
 };
 
 } // namespace
