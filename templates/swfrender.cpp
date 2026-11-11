@@ -60,6 +60,26 @@ const Texture& Renderer::texture(const std::string& relPath) {
                             (uint32_t(p[1]) << 8) | uint32_t(p[2]);
             }
             tex.ok = true;
+
+            // JPEG3 alpha: a sibling "<name>.alpha.png" grayscale mask
+            // supplies the texture's alpha channel.
+            std::string maskPath;
+            size_t dot = full.find_last_of('.');
+            if (dot != std::string::npos) {
+                maskPath = full.substr(0, dot) + ".alpha.png";
+            }
+            if (!maskPath.empty()) {
+                int mw = 0, mh = 0, mch = 0;
+                stbi_uc* mask = stbi_load(maskPath.c_str(), &mw, &mh, &mch, 1);
+                if (mask && mw == w && mh == h) {
+                    for (size_t i = 0, n = static_cast<size_t>(w) * h;
+                         i < n; ++i) {
+                        tex.px[i] = (uint32_t(mask[i]) << 24) |
+                                    (tex.px[i] & 0x00FFFFFFu);
+                    }
+                }
+                if (mask) stbi_image_free(mask);
+            }
         }
         if (data) stbi_image_free(data);
     }

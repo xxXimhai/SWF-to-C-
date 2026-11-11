@@ -283,6 +283,36 @@ def sniff_image_ext(data: bytes) -> str:
     return "bin"
 
 
+def _jpeg_size(data: bytes):
+    """Return (width, height) of a JPEG by scanning for an SOF marker."""
+    n = len(data)
+    i = 2  # skip SOI
+    while i + 4 <= n:
+        if data[i] != 0xFF:
+            i += 1
+            continue
+        j = i + 1
+        while j < n and data[j] == 0xFF:
+            j += 1
+        if j >= n:
+            break
+        mk = data[j]
+        if mk == 0x00 or mk == 0x01 or 0xD0 <= mk <= 0xD9:
+            i = j + 1
+            continue
+        if mk == 0xDA:      # SOS: entropy data follows, dims already found
+            break
+        if j + 9 > n:
+            break
+        seglen = struct.unpack_from(">H", data, j + 1)[0]
+        if mk in (0xC0, 0xC1, 0xC2):
+            h = struct.unpack_from(">H", data, j + 4)[0]
+            w = struct.unpack_from(">H", data, j + 6)[0]
+            return w, h
+        i = j + 1 + seglen
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Vector shape parsing (DefineShape/2/3/4) + CPU rasterization.
 #
@@ -1132,10 +1162,37 @@ class SwfParser:
                 info = {"kind": "image", "file": fname, "ext": "jpg",
                         "w": 0, "h": 0}
                 if has_alpha:
-                    info["alpha"] = True
-                    self.warnings.append(
-                        f"image id {cid}: JPEG3 alpha channel not merged "
-                        "(saved as JPEG)")
+                    # AlphaData = zlib stream of w*h grayscale bytes.
+                    # Emit a sibling .alpha.png mask; the player applies
+                    # it as the texture's alpha channel.
+                    try:
+                        wh = _jpeg_size(jpeg)
+                        alpha = None
+                        for base in (6 + alpha_off, alpha_off):
+                            try:
+                                alpha = zlib.decompress(p[base:])
+                                break
+                            except Exception:
+                                continue
+                        if wh and alpha and len(alpha) >= wh[0] * wh[1]:
+                            w, h = wh
+                            raw = bytearray(h * (w + 1))
+                            for y in range(h):
+                                row = y * (w + 1)
+                                raw[row + 1:row + 1 + w] = \
+                                    alpha[y * w:(y + 1) * w]
+                            afname = f"img_{cid}.alpha.png"
+                            with open(os.path.join(
+                                    self.out_assets, "images", afname),
+                                    "wb") as f:
+                                f.write(_png_bytes(w, h, 0, bytes(raw)))
+                            info["alphaFile"] = afname
+                        else:
+                            self.warnings.append(
+                                f"image id {cid}: JPEG3 alpha decode failed")
+                    except Exception as e:
+                        self.warnings.append(
+                            f"image id {cid}: JPEG3 alpha error: {e}")
                 self.chars[cid] = info
             return
         if code == 90:     # DefineBitsJPEG4
@@ -1341,6 +1398,7 @@ class SwfParser:
         if len(p) < 4:
             return
         flags = struct.unpack_from(">H", p, 0)[0]  # big-endian bit field
+        # bit order per SWF spec / FFDec PlaceObject3Tag
         has_clip_actions = flags & 0x8000
         has_clip_depth = flags & 0x4000
         has_name = flags & 0x2000
@@ -1385,15 +1443,15 @@ class SwfParser:
             off += 2
         visible = None
         if has_filters:
-            # FilterList records are variable-length and rare; skip the
-            # rest of this record's optional fields but keep the placement
-            # (drawing it unfiltered is a better approximation than
-            # dropping the object entirely).
+            # FilterList records are variable-length and rare; keep the
+            # placement (drawing it unfiltered is a better approximation
+            # than dropping the object) — later fields are unreachable.
             if "PlaceObject3 with filters" not in self.warnings:
                 self.warnings.append("PlaceObject3 with filters skipped")
             self._apply_place(depth, char_id, matrix, name, bool(is_move),
                               cxform=cxform)
             return
+        # field order: blend, cache, visible, bgColor, clipActions
         if has_blend:
             off += 1
         if has_cache:
