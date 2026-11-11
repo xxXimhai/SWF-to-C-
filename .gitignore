@@ -1,0 +1,16 @@
+# Build output of generated C++ projects
+build/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+*.o
+*.exe
+
+# Local test SWFs (do not redistribute; regenerate fixtures instead)
+*.swf
+!tests/fixtures/*.swf
+
+# Python
+__pycache__/
+*.pyc
