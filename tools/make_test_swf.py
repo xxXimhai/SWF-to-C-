@@ -15,6 +15,7 @@ import os
 import struct
 import sys
 import zlib
+import lzma
 
 
 class BitWriter:
@@ -197,7 +198,7 @@ def define_sprite(sid, frame_count, inner_tags):
     return tag(39, body)
 
 
-def main(out_path):
+def main(out_path, zws=False):
     W, H = 16, 16
     # checkerboard-ish ARGB image: red/blue quadrants
     px = bytearray()
@@ -242,12 +243,25 @@ def main(out_path):
     body = stage + struct.pack("<H", 24 * 256) + struct.pack("<H", 3)
     body += b"".join(tags)
 
-    header = b"FWS" + bytes([8]) + struct.pack("<I", 8 + len(body))
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    with open(out_path, "wb") as f:
-        f.write(header + body)
-    print(f"wrote {out_path} ({8 + len(body)} bytes)")
+    if zws:
+        compressed = lzma.compress(body)
+        header = b"ZWS" + bytes([8]) + struct.pack("<I", 8 + len(compressed))
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        with open(out_path, "wb") as f:
+            f.write(header + compressed)
+        print(f"wrote {out_path} ({8 + len(compressed)} bytes, ZWS/LZMA)")
+    else:
+        header = b"FWS" + bytes([8]) + struct.pack("<I", 8 + len(body))
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        with open(out_path, "wb") as f:
+            f.write(header + body)
+        print(f"wrote {out_path} ({8 + len(body)} bytes)")
 
 
 if __name__ == "__main__":
-    main(sys.argv[1] if len(sys.argv) > 1 else "simple.swf")
+    import argparse
+    parser = argparse.ArgumentParser(description="Generate a tiny .swf file for testing")
+    parser.add_argument("out_path", nargs="?", default="simple.swf", help="output .swf path")
+    parser.add_argument("--zws", action="store_true", help="emit ZWS (LZMA-compressed) container")
+    args = parser.parse_args()
+    main(args.out_path, zws=args.zws)
